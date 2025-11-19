@@ -2,84 +2,139 @@ from models.intent_classifier import IntentClassifier
 from models.translator import Translator
 from models.normalizer import Normalizer
 from models.chat_model import ChatModel
-from models.robot_car_controller import RobotCarController
+
+# 신규 RAG + 행동 판단 모듈들
+from models.rag.personal_rag import PersonalRAG
+from models.rag.personal_response import PersonalResponse
+from models.rag.behavior_detector import BehaviorDetector
+from models.rag.decision_model import DecisionModel
+
+# 로봇 모듈 (기존 그대로 유지)
 from models.robot_planner import RobotPlanner
-import json
-import os
-import time
+from models.robot_car_controller import RobotCarController
+
 
 class Router:
-    """
-    Intent에 따라 적절한 처리 경로로 분기하는 Router.
-    """
-
     def __init__(self):
+        # 기존 모듈들
         self.intent_classifier = IntentClassifier()
         self.translator = Translator()
         self.normalizer = Normalizer()
         self.chat_model = ChatModel()
-        # rag_retriever는 이후 단계에서 추가 예정
 
-        # 로봇카 제어기 연결
-        self.robot_car = RobotCarController()
+        # 로봇 관련
         self.planner = RobotPlanner()
+        self.robot_car = RobotCarController()
 
-        # drive_map.json 로드
-        drive_map_path = "./data/planner_map.json"
-        with open(drive_map_path, "r") as f:
-            self.drive_map = json.load(f)
+        # 신규 AI 모듈들
+        self.rag = PersonalRAG()
+        self.personal_response = PersonalResponse()
+        self.behavior_detector = BehaviorDetector()
+        self.decision_model = DecisionModel()
 
-    def handle(self, text: str) -> str:
-        """
-        입력 텍스트를 intent에 따라 적절한 모듈에 전달하고 결과 문자열을 반환.
-        """
+        # 제안 후 응답 상태
+        self.waiting_for_decision = False
+        self.pending_task = None   # normalized single_task 저장용
+
+
+    # =================================================
+    #  메인 처리 함수
+    # =================================================
+    def handle(self, text: str):
+        # 1) Intent 분류
         intent_result = self.intent_classifier.classify(text)
         intent = intent_result.intent
+        print(f"[Intent] {intent} ({intent_result.reason})")
 
-        #print(f"[Intent] {intent} ({intent_result.reason})")
+        # -------------------------------------------------------
+        # 2) 제안 → 사용자 응답 YES/NO 판단 state인지 체크
+        # -------------------------------------------------------
+        if self.waiting_for_decision:
+            decision = self.decision_model.decide(text)
+            print(f"[Decision] {decision}")
 
-        # 1) 로봇 명령일 경우
-        if intent == "robot_command":
-            # 1-1) 번역
-            english = self.translator.translate(text)
-            #print(f"[Translate] {english}")
+            if decision == "YES":
+                print(f"[Robot] Task 실행: {self.pending_task}")
 
-            # 1-2) 정규화
-            task = self.normalizer.normalize(english)
-            #print(f"[Normalize] {task}")
+                plan = self.planner.plan(self.pending_task)
+                if plan:
+                    linear = plan["linear"]
+                    angular = plan["angular"]
+                    duration = plan["duration"]
 
-            # If task is a robot car command
-            if task in self.drive_map:
-                linear = self.drive_map[task]["linear"]
-                angular = self.drive_map[task]["angular"]
+                    # 로봇카 제어 (기존 방식 유지)
+                    self.robot_car.send_speed(linear, angular)
+                    import time
+                    time.sleep(duration)
+                    self.robot_car.send_speed(0, 0)
 
-                ack = self.robot_car.send_speed(linear, angular)
-                print(f"[RobotCar] Sent speeds → {ack}")
-
-                return f"{task}"
-            # 2) robot arm command → planner 확인
+                response = "도와드릴게요!"
             else:
-                planner_cmd = self.planner.plan(task)
-                if planner_cmd:
-                    linear = planner_cmd["linear"]
-                    angular = planner_cmd["angular"]
-                    duration = planner_cmd["duration"]
+                response = "알겠습니다. 필요한 게 있을 때 다시 말씀해주세요."
 
-                    print(f"[RobotCar][Planner] {task} → {linear}/{angular} for {duration} sec")
-
-                    if duration > 0:
-                        self.robot_car.send_speed(linear, angular)
-                        time.sleep(duration)
-                        self.robot_car.send_speed(0, 0)
-
-                    return task
-
-        # 2) 약 정보 intent → (다음 단계에서 구현)
-        elif intent == "medicine_info":
-            return "(TODO) 약 정보 모듈 연결 예정"
-
-        # 3) 일반 대화 intent → (다음 단계에서 구현)
-        else:
-            response = self.chat_model.chat(text)
-            #print(f"[Chat] {response}")
+            self.waiting_for_decision = False
+            self.pending_task = None
             return response
+
+        # =======================================================
+        # 3) robot_command (기존 로직 유지)
+        # =======================================================
+        if intent == "robot_command":
+            english = self.translator.translate(text)
+            command = self.normalizer.normalize(english)
+
+            print(f"[Translate] {english}")
+            print(f"[Normalize] {command}")
+
+            plan = self.planner.plan(command)
+            if plan:
+                linear = plan["linear"]
+                angular = plan["angular"]
+                duration = plan["duration"]
+
+                self.robot_car.send_speed(linear, angular)
+                import time
+                time.sleep(duration)
+                self.robot_car.send_speed(0, 0)
+
+            return f"명령을 수행합니다: {command}"
+
+        # =======================================================
+        # 4) dialog → 행동 필요 여부 판단
+        # =======================================================
+        if intent == "dialog":
+            need_action = self.behavior_detector.detect(text)
+            print(f"[BehaviorNeeded] {need_action}")
+
+            # --------- 행동 필요 없음 → 일반 대화 ---------
+            if not need_action:
+                return self.chat_model.chat(text)
+
+            # --------- 행동 필요 → RAG 기반 제안 생성 ---------
+            context = self.rag.build_context(text)
+            suggestion = self.personal_response.generate(text, context)
+
+            print(f"[Suggestion] {suggestion}")
+
+            # suggestion을 영어로 번역 → canonical task로 변환
+            english = self.translator.translate(suggestion)
+            canonical = self.normalizer.normalize(english)
+
+            print(f"[Translator->Canonical] {canonical}")
+
+            # 다음 사용자 답변에서 YES/NO 판단하도록 대기
+            self.waiting_for_decision = True
+            self.pending_task = canonical
+
+            return suggestion
+
+        # =======================================================
+        # 5) medicine_info (기존 기능 나중에)
+        # =======================================================
+        if intent == "medicine_info":
+            return "약 정보 기능은 아직 준비 중입니다."
+
+        # =======================================================
+        # 6) fallback
+        # =======================================================
+        return "무슨 말씀이신지 잘 이해하지 못했어요."

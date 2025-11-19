@@ -37,6 +37,7 @@ examples-rclpy-minimal-client==0.19.6
 examples-rclpy-minimal-publisher==0.19.6
 examples-rclpy-minimal-service==0.19.6
 examples-rclpy-minimal-subscriber==0.19.6
+faiss-cpu==1.13.0
 fastapi==0.121.2
 filelock==3.20.0
 fsspec==2025.10.0
@@ -94,6 +95,7 @@ pydantic_core==2.41.5
 python-dotenv==1.2.1
 python-qt-binding==2.2.1
 PyYAML==6.0.3
+pyzmq==27.1.0
 qt-dotgraph==2.7.5
 qt-gui==2.7.5
 qt-gui-cpp==2.7.5
@@ -106,6 +108,7 @@ regex==2025.11.3
 requests==2.32.5
 resource-retriever==3.4.4
 rmw-dds-common==3.1.0
+robot==20071211
 ros2action==0.32.6
 ros2bag==0.26.9
 ros2bag-mcap-cli==0.26.9
@@ -204,3 +207,4 @@ vision-msgs==4.1.1
 visualization-msgs==5.3.6
 watchfiles==1.1.1
 websockets==15.0.1
+zmq==0.0.0

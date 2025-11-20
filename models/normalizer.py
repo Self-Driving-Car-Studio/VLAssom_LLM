@@ -72,7 +72,12 @@ class Normalizer:
 
         result = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        # 마지막 답변만 추출
+        clean = result.split("Normalized task:")[-1]
+        clean = clean.strip().split("\n")[0]  # 혹시 뒤에 이상한 줄 있으면 제거
+        return clean
+
+
+"""        # 마지막 답변만 추출
         last_line = result.split("Normalized task:")[-1].strip()
 
-        return last_line
+        return last_line"""

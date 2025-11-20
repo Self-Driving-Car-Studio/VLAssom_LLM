@@ -23,7 +23,7 @@ class PersonalRAG:
     def __init__(
         self,
         profile_path: str = "./data/test_profile.txt",
-        embedding_model: str = "text-embedding-3-small",
+        embedding_model: str = "text-embedding-3-large",
         top_k: int = 3,
     ):
         self.profile_path = profile_path
@@ -56,12 +56,29 @@ class PersonalRAG:
 
     def _split_into_chunks(self, text: str) -> List[str]:
         """
-        아주 단순하게:
-        - 빈 줄(두 줄 이상 공백) 기준으로 문단 단위 split
-        - 너무 짧은 건 버림
+        Semantic chunking (개선안)
+            - 문장을 절대로 제거하지 않는다
+            - 문장 단위로 split
+            - 문장 2~3개씩 하나의 chunk로 묶기
         """
-        raw_chunks = re.split(r"\n\s*\n", text)
-        chunks = [c.strip() for c in raw_chunks if len(c.strip()) > 5]
+        # 1. 문장 나누기
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 0]
+
+        chunks = []
+        current = []
+        MAX_SENT = 3  # 문장당 2~3개씩 묶기
+
+        for s in sentences:
+            current.append(s)
+            if len(current) >= MAX_SENT:
+                chunks.append(" ".join(current))
+                current = []
+
+        # 마지막 덩어리 추가
+        if current:
+            chunks.append(" ".join(current))
+
         return chunks
 
     def _embed_texts(self, texts: List[str]) -> np.ndarray:
@@ -99,29 +116,66 @@ class PersonalRAG:
         index.add(embeddings)
         self.index = index
 
+    def extract_keywords(self, sentences: List[str]) -> List[str]:
+        """
+        문장 리스트에서 명사성 단어만 자동 추출.
+        규칙 기반 간단 버전 (불용어 제거 포함).
+        """
+        text = " ".join(sentences)
+
+        # 단순 명사 후보 추출 (한글 or 영어 단어)
+        candidates = re.findall(r"[가-힣A-Za-z]{2,}", text)
+
+        # 불용어 필터
+        stopwords = ["사용자", "있다", "한다", "하고", "하며", "있는", "그래서"]
+        filtered = [w for w in candidates if w not in stopwords]
+
+        # 중복 제거
+        return list(set(filtered))
+
+    def auto_expand_query(self, query: str, num_similar=3) -> str:
+        """
+        embedding 기반 문장 유사도 검색 후
+        주요 단어를 자동 추출하여 query 확장.
+        """
+        # 1) query embedding
+        q_emb = self._embed_texts([query])
+        if q_emb.shape[0] == 0:
+            return query
+
+        # 2) 프로필 문장에서 semantic similarity top-N 검색
+        distances, indices = self.index.search(q_emb, num_similar)
+        similar_sentences = [self.chunks[idx] for idx in indices[0] if idx < len(self.chunks)]
+
+        # 3) 키워드 자동 추출
+        keywords = self.extract_keywords(similar_sentences)
+
+        # 4) query 확장 구성
+        expanded_query = query + " " + " ".join(keywords)
+        #print(f"[AutoExpandQuery] {expanded_query}")
+
+        return expanded_query
+
     # ---------------------------
     # 외부에서 쓰는 메소드들
     # ---------------------------
     def search(self, query: str, top_k: int = None) -> List[Tuple[str, float]]:
-        """
-        query 에 대해 가장 비슷한 chunk들을 반환.
-        return: [(chunk_text, distance), ...]
-        """
         if top_k is None:
             top_k = self.top_k
 
-        # query embedding
-        q_emb = self._embed_texts([query])  # (1, D)
+        # Step 4 자동 Query Expansion
+        expanded_query = self.auto_expand_query(query)
+
+        # 1) embedding
+        q_emb = self._embed_texts([expanded_query])
         if q_emb.shape[0] == 0:
             return []
 
-        # FAISS 검색
+        # 2) 검색
         distances, indices = self.index.search(q_emb, top_k)
-        distances = distances[0]
-        indices = indices[0]
 
-        results: List[Tuple[str, float]] = []
-        for idx, dist in zip(indices, distances):
+        results = []
+        for idx, dist in zip(indices[0], distances[0]):
             if 0 <= idx < len(self.chunks):
                 results.append((self.chunks[idx], float(dist)))
 

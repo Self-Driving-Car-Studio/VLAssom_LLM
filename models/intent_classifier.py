@@ -14,7 +14,7 @@ class IntentResult:
 class IntentClassifier:
     def __init__(self):
         self.robot_keywords = [
-            "가져와", "가져다줘", "집어줘", "잡아줘", "옮겨줘", "전달해줘", "줘"
+            "가져와", "가져다줘", "집어줘", "잡아줘", "옮겨줘", "전달해줘", "줘", "가져다"
         ]
 
     def classify(self, text: str) -> IntentResult:

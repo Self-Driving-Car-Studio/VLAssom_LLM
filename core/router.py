@@ -9,10 +9,6 @@ from models.rag.personal_response import PersonalResponse
 from models.rag.behavior_detector import BehaviorDetector
 from models.rag.decision_model import DecisionModel
 
-# 로봇 모듈 (기존 그대로 유지)
-from models.robot_planner import RobotPlanner
-from models.robot_car_controller import RobotCarController
-
 
 class Router:
     def __init__(self):
@@ -21,10 +17,6 @@ class Router:
         self.translator = Translator()
         self.normalizer = Normalizer()
         self.chat_model = ChatModel()
-
-        # 로봇 관련
-        self.planner = RobotPlanner()
-        self.robot_car = RobotCarController()
 
         # 신규 AI 모듈들
         self.rag = PersonalRAG()
@@ -55,20 +47,7 @@ class Router:
 
             if decision == "YES":
                 #print(f"[Robot] Task 실행: {self.pending_task}")
-
-                plan = self.planner.plan(self.pending_task)
-                if plan:
-                    linear = plan["linear"]
-                    angular = plan["angular"]
-                    duration = plan["duration"]
-
-                    # 로봇카 제어 (기존 방식 유지)
-                    self.robot_car.send_speed(linear, angular)
-                    import time
-                    time.sleep(duration)
-                    self.robot_car.send_speed(0, 0)
-
-                response = "도와드릴게요!"
+                response = f"'{self.pending_task}' 명령을 수행하겠습니다."
             else:
                 response = "알겠습니다. 필요한 게 있을 때 다시 말씀해주세요."
 
@@ -85,17 +64,6 @@ class Router:
 
             #print(f"[Translate] {english}")
             print(f"[Normalize] {command}")
-
-            plan = self.planner.plan(command)
-            if plan:
-                linear = plan["linear"]
-                angular = plan["angular"]
-                duration = plan["duration"]
-
-                self.robot_car.send_speed(linear, angular)
-                import time
-                time.sleep(duration)
-                self.robot_car.send_speed(0, 0)
 
             return f"명령을 수행합니다: {command}"
 

@@ -47,7 +47,9 @@ class Router:
 
             if decision == "YES":
                 #print(f"[Robot] Task 실행: {self.pending_task}")
-                response = f"'{self.pending_task}' 명령을 수행하겠습니다."
+                #response = f"'{self.pending_task}' 명령을 수행하겠습니다."
+                self.dispatcher.send(self.pending_task)
+                response = "알겠습니다. 처리할게요!"
             else:
                 response = "알겠습니다. 필요한 게 있을 때 다시 말씀해주세요."
 
@@ -65,7 +67,9 @@ class Router:
             #print(f"[Translate] {english}")
             print(f"[Normalize] {command}")
 
-            return f"명령을 수행합니다: {command}"
+            #return f"명령을 수행합니다: {command}"
+            self.dispatcher.send(command)
+            return "네, 처리할게요."
 
         # =======================================================
         # 4) dialog → 행동 필요 여부 판단

@@ -1,3 +1,6 @@
+import json
+import os
+
 class Router:
     # =================================================
     #  메인 처리 함수
@@ -16,24 +19,38 @@ class Router:
             self.pending_task = None
             self.history = []
 
+            # Action Map 로드
+            self.action_map = {}
+            map_path = os.path.join("data", "action_map.json")
+            try:
+                with open(map_path, "r", encoding="utf-8") as f:
+                    self.action_map = json.load(f)
+                print(f"[System] Action Map Loaded: {len(self.action_map)} commands")
+            except FileNotFoundError:
+                print(f"[System] Warning: {map_path} not found.")
+
+    # [전송 함수] Value(긴 코드)를 받아서 전송만 담당
+    def _execute_command(self, payload_value: str):
+        print(f"🚀 [ROBOT SEND] Sending payload: {payload_value}")
+        # 실제 통신 코드 (ROS, HTTP 등) 작성 위치
+
     def handle(self, text: str):
         # 1) Intent 분류
         intent_result = self.intent_classifier.classify(text)
         intent = intent_result.intent
         print(f"[Intent] {intent} ({intent_result.reason})")
 
-        # -------------------------------------------------------
-        # 2) 제안 → 사용자 응답 YES/NO 판단 state인지 체크
-        # -------------------------------------------------------
+        # 2) 제안 수락 여부 (Decision)
         if self.waiting_for_decision:
             decision = self.decision_model.decide(text)
-            #print(f"[Decision] {decision}")
-
             if decision == "YES":
-                #print(f"[Robot] Task 실행: {self.pending_task}")
-                #response = f"'{self.pending_task}' 명령을 수행하겠습니다."
-                self.dispatcher.send(self.pending_task)
-                response = "알겠습니다. 처리할게요!"
+                # pending_task는 이미 정확한 Key 값이므로 바로 Map에서 꺼냄
+                if self.pending_task in self.action_map:
+                    payload = self.action_map[self.pending_task]
+                    self._execute_command(payload) # Value 전송
+                    response = "알겠습니다. 처리할게요!"
+                else:
+                    response = "오류가 발생했습니다. 해당 명령 코드를 찾을 수 없어요."
             else:
                 response = "알겠습니다. 필요한 게 있을 때 다시 말씀해주세요."
 
@@ -41,69 +58,72 @@ class Router:
             self.pending_task = None
             return response
 
-        # =======================================================
-        # 3) robot_command (기존 로직 유지)
-        # =======================================================
+        # 3) Robot Command 처리 (직접 명령)
         if intent == "robot_command":
-            english = self.translator.translate(text)
-            command = self.normalizer.normalize(english)
+            # (1) 번역
+            english_text = self.translator.translate(text)
+            
+            # (2) Normalizer -> Key 획득 (예: "serve_tylenol")
+            command_key = self.normalizer.normalize(english_text)
+            print(f"[Normalizer Key] {command_key}")
 
-            #print(f"[Translate] {english}")
-            print(f"[Normalize] {command}")
+            # (3) Router -> Map Lookup -> Value 획득
+            if command_key in self.action_map:
+                robot_payload = self.action_map[command_key]
+                self._execute_command(robot_payload)
+                return "네, 처리할게요."
+            else:
+                return "죄송해요. 제가 수행할 수 없는 명령이에요."
 
-            #return f"명령을 수행합니다: {command}"
-            self.dispatcher.send(command)
-            return "네, 처리할게요."
-
-        # =======================================================
-        # 4) dialog → 행동 필요 여부 판단
-        # =======================================================
+        # 4) Dialog 처리 (제안 로직 수정됨)
         if intent == "dialog":
             need_action = self.behavior_detector.detect(text)
-            #print(f"[BehaviorNeeded] {need_action}")
-
-            # --------- 행동 필요 없음 → RAG-enhanced 일반 대화 ---------
+            
+            # (행동 불필요) -> 단순 대화
             if not need_action:
-                # 개인 프로필 기반 context 생성
+                # ... (기존과 동일)
                 context = self.rag.build_context(text)
-                #print(f"[RAG Context]\n{context}\n")
-
-                # context가 있으면 개인화 프롬프트, 없으면 기존 그대로
                 if context and context.strip():
                     prompt = (
-                        "아래는 사용자의 개인 프로필 정보입니다. 이 정보를 참고하되, "
-                        "사실처럼 단정 짓지 말고 '추측'임을 전제로 공감과 조언 위주로 답변하세요.\n"
-                        "프로필이 현재 대화와 크게 상관 없으면 무시해도 됩니다.\n\n"
-                        f"=== 사용자 프로필 ===\n{context}\n"
-                        "=====================\n\n"
-                        f"=== 사용자 입력 ===\n{text}\n"
-                        "=====================\n\n"
-                        "위 정보를 모두 고려해서, 자연스러운 한국어 한두 문장으로 대답하세요."
+                        f"사용자 프로필:\n{context}\n\n"
+                        f"사용자 입력:\n{text}\n\n"
+                        "위 정보를 바탕으로 공감하는 짧은 답변을 하세요."
                     )
                     return self.chat_model.chat(prompt)
                 else:
-                    # RAG가 아무 것도 못 찾으면 예전처럼 동작
                     return self.chat_model.chat(text)
 
-            # --------- 행동 필요 → RAG 기반 제안 생성 (기존 로직 유지) ---------
+            # (행동 필요) -> 제안 생성 (Key 포함)
             context = self.rag.build_context(text)
-            suggestion = self.personal_response.generate(text, context)
+            
+            # PersonalResponse가 "멘트 || Key" 형태로 반환함
+            generated_output = self.personal_response.generate(text, context)
+            
+            # [수정 포인트] 따옴표(")까지 확실하게 제거하도록 수정
+            if "||" in generated_output:
+                suggestion_text, action_key = generated_output.split("||")
+                
+                # 공백(.strip()) 뿐만 아니라 따옴표(.strip('"'))도 제거
+                suggestion_text = suggestion_text.strip().strip('"') 
+                action_key = action_key.strip().strip('"')           
+            else:
+                suggestion_text = generated_output.strip().strip('"')
+                action_key = "NONE"
 
-            #print(f"[Suggestion] {suggestion}")
+            print(f"[Proposal Log] 멘트: {suggestion_text} / 키: {action_key}")
 
-            # suggestion을 영어로 번역 → canonical task로 변환
-            english = self.translator.translate(suggestion)
-            canonical = self.normalizer.normalize(english)
+            # 유효한 Key가 있는 경우에만 대기 상태 진입
+            if action_key in self.action_map:
+                self.waiting_for_decision = True
+                self.pending_task = action_key
+                return suggestion_text
+            
+            else:
+                # [수정] 매칭 실패 시 원인을 출력해주는 로그 추가
+                if action_key != "NONE":
+                    print(f"⚠️ [WARNING] 생성된 Key '{action_key}'가 action_map에 없습니다!")
+                    print(f"   (보유 중인 Keys: {list(self.action_map.keys())})")
+                
+                return suggestion_text
 
-            #print(f"[Translator->Canonical] {canonical}")
-
-            # 다음 사용자 답변에서 YES/NO 판단하도록 대기
-            self.waiting_for_decision = True
-            self.pending_task = canonical
-
-            return suggestion
-
-        # =======================================================
-        # 6) fallback
-        # =======================================================
         return "무슨 말씀이신지 잘 이해하지 못했어요."

@@ -8,7 +8,11 @@ import numpy as np
 import cv2
 from typing import Dict
 from core.router import Router
+from core.model_loader import ModelContainer
 
+# [중요] 서버 시작 시점에 전역 변수로 모델 로딩
+# 이렇게 하면 uvicorn 워커 하나당 모델 1세트만 존재하게 됩니다.
+global_models = ModelContainer.get_instance()
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
 # Socket.IO 서버 생성
@@ -24,7 +28,7 @@ async def connect(sid, environ):
     print(f"✅ 클라이언트 연결됨: {sid}")
     # 연결 시 해당 유저를 위한 라우터 생성
     try:
-        sessions[sid] = Router()
+        sessions[sid] = Router(models=global_models)
     except Exception as e:
         print(f"🚨 Router 생성 실패: {e}")
 

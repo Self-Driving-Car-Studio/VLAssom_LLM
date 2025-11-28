@@ -1,37 +1,21 @@
-from models.intent_classifier import IntentClassifier
-from models.translator import Translator
-from models.normalizer import Normalizer
-from models.chat_model import ChatModel
-
-# 신규 RAG + 행동 판단 모듈들
-from models.rag.personal_rag import PersonalRAG
-from models.rag.personal_response import PersonalResponse
-from models.rag.behavior_detector import BehaviorDetector
-from models.rag.decision_model import DecisionModel
-
-
 class Router:
-    def __init__(self):
-        # 기존 모듈들
-        self.intent_classifier = IntentClassifier()
-        self.translator = Translator()
-        self.normalizer = Normalizer()
-        self.chat_model = ChatModel()
-
-        # 신규 AI 모듈들
-        self.rag = PersonalRAG()
-        self.personal_response = PersonalResponse()
-        self.behavior_detector = BehaviorDetector()
-        self.decision_model = DecisionModel()
-
-        # 제안 후 응답 상태
-        self.waiting_for_decision = False
-        self.pending_task = None   # normalized single_task 저장용
-
-
     # =================================================
     #  메인 처리 함수
     # =================================================
+
+    def __init__(self, models):
+            # 1. 무거운 모델은 외부에서 받아옴 (참조만 함, 메모리 차지 X)
+            self.models = models 
+            
+            # 편의를 위한 바로가기 (Alias)
+            self.classifier = models.intent_classifier
+            self.chat_model = models.chat_model
+
+            # 2. 사용자별 고유 상태값 (여기는 개별 유지)
+            self.waiting_for_decision = False
+            self.pending_task = None
+            self.history = []
+
     def handle(self, text: str):
         # 1) Intent 분류
         intent_result = self.intent_classifier.classify(text)

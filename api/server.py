@@ -10,6 +10,8 @@ from typing import Dict, Any, Optional
 import base64
 import uuid
 import asyncio
+import librosa
+import torch
 
 from pydub import AudioSegment
 from pydub.effects import normalize as pydub_normalize
@@ -27,6 +29,7 @@ except ImportError:
 # 환경 설정
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 PORT = int(os.getenv("PORT", 3000))
+HEALTH_KEYWORDS = ["병원", "진료", "의사", "간호사", "증상", "아파", "예약", "상담", "건강", "수술", "검진", "약", "복용"]
 
 # ----------------------------------------------------------------
 # 1. 전역 모델 로딩 (Singleton)
@@ -165,7 +168,7 @@ async def handle_action_confirm(sid, data):
 @sio.on('audio-upload')
 async def handle_audio_upload(sid, data):
     """
-    앱 -> 서버: 음성 수신 -> [전처리] -> Whisper STT -> Router -> 응답
+    앱 -> 서버: 수신 -> 전처리 -> [하이브리드 STT] -> Router -> 응답
     """
     print(f"🎤 오디오 데이터 수신 ({sid})")
     
@@ -173,111 +176,173 @@ async def handle_audio_upload(sid, data):
     if not router:
         return
 
-    # 임시 파일 경로 변수들 초기화
     raw_filename = None
     processed_filename = None
 
     try:
-        # 1. 데이터 파싱
+        # -------------------------------------------------------
+        # 1. 데이터 파싱 및 파일 저장
+        # -------------------------------------------------------
         b64_string = data.get('audioData')
         file_ext = data.get('format', 'm4a')
         user_id = data.get('userId', 'unknown')
 
-        # Base64 디코딩
         audio_bytes = base64.b64decode(b64_string)
         
         if not os.path.exists('uploads'):
             os.makedirs('uploads')
             
-        # 2. 원본 파일 저장 (.m4a)
         raw_filename = f"uploads/{user_id}_{uuid.uuid4()}.{file_ext}"
         with open(raw_filename, "wb") as f:
             f.write(audio_bytes)
             
         print(f"💾 원본 저장 완료: {raw_filename}")
 
-        # =======================================================
-        # [✨ 추가됨] 3. 오디오 전처리 (Preprocessing)
-        # Whisper가 가장 좋아하는 형태(16kHz, Mono, Normalized)로 변환
-        # =======================================================
+        # -------------------------------------------------------
+        # 2. 오디오 전처리 (Preprocessing)
+        # -------------------------------------------------------
         def preprocess_audio():
-            print("🎛️ 오디오 전처리 중... (Resample & Normalize)")
-            
-            # 원본 로드
+            print("🎛️ 전처리: Resample(16k) & Normalize")
             audio = AudioSegment.from_file(raw_filename, format=file_ext)
+            audio = audio.set_channels(1)       # Mono
+            audio = audio.set_frame_rate(16000) # 16kHz
+            audio = pydub_normalize(audio)      # Volume Maximize
             
-            # (1) 모노로 변환 (채널 1개)
-            audio = audio.set_channels(1)
-            
-            # (2) 주파수 16000Hz로 변경 (Whisper 내부 표준)
-            audio = audio.set_frame_rate(16000)
-            
-            # (3) 볼륨 정규화 (작은 목소리 증폭)
-            audio = pydub_normalize(audio)
-            
-            # 전처리된 파일명 생성 (.wav)
             new_filename = raw_filename.replace(f".{file_ext}", "_processed.wav")
-            
-            # wav 포맷으로 저장
             audio.export(new_filename, format="wav")
             return new_filename
 
-        # 전처리 실행 (동기 작업이므로 스레드로 분리 권장)
         processed_filename = await asyncio.to_thread(preprocess_audio)
         print(f"✨ 전처리 완료: {processed_filename}")
 
-        # =======================================================
-        # 4. Whisper STT 변환
-        # =======================================================
-        print("👂 Whisper 인식 중...")
-        stt_model = global_models.stt_model
-        
-        def transcribe_audio():
-            # [중요] 원본 대신 '전처리된 wav 파일'을 넣습니다.
-            # beam_size=5: 정확도를 위해 탐색 폭을 넓힘 (기본값 1보다 느리지만 정확함)
-            return stt_model.transcribe(
+        # -------------------------------------------------------
+        # 3. [1차] 일반 Whisper 인식 (확신도 체크)
+        # -------------------------------------------------------
+        print("👂 [1단계] 일반 모델 인식 중...")
+        models = global_models # ModelContainer 인스턴스
+
+        def transcribe_std():
+            # OpenAI 모델은 딕셔너리를 반환하며 'segments' 안에 'avg_logprob'가 있음
+            result = models.stt_model.transcribe(
                 processed_filename, 
                 language="ko", 
                 fp16=False,
                 beam_size=5,
                 initial_prompt="건강 상담, 몸 상태, 허약 체질, 병원 진료에 대한 대화입니다."
             )
-
-        result = await asyncio.to_thread(transcribe_audio)
-        recognized_text = result['text'].strip()
-        
-        print(f"🗣️ 인식된 텍스트: \"{recognized_text}\"")
-
-        # -------------------------------------------------------
-        # 5. 실패 처리 및 사용자 피드백 전송
-        # -------------------------------------------------------
-        if not recognized_text:
-            await sio.emit('command-response', {"text": "음성이 너무 작거나 들리지 않았어요.", "type": "simple"}, to=sid)
-        else:
-            # 인식 성공 시, 앱에 내 말 먼저 띄워주기
-            await sio.emit('user-speech', {'text': recognized_text}, to=sid)
-
-            # 6. Router 실행
-            response_data = await asyncio.to_thread(router.handle, recognized_text)
             
-            # 7. 최종 응답
-            payload = format_response_payload(response_data)
-            await sio.emit('command-response', payload, to=sid)
-            print(f"📤 응답 전송: {payload}")
+            text = result['text'].strip()
+            # 확신도(Log Probability) 추출 (0에 가까울수록 확실, -1 이하면 불확실)
+            # segments가 비어있을 수 있으므로 예외처리
+            score = -10.0
+            if result.get('segments'):
+                score = result['segments'][0].get('avg_logprob', -10.0)
+            
+            return text, score
+
+        text_std, score_std = await asyncio.to_thread(transcribe_std)
+        print(f"🗣️ [1차 결과] '{text_std}' (확신도: {score_std:.2f})")
+
+        # -------------------------------------------------------
+        # 4. [판단] 구음장애 모델 가동 여부 결정
+        # -------------------------------------------------------
+        use_dys_model = False
+        
+        # 조건 A: 확신도가 낮음 (AI가 잘 못알아들음) -> -0.7 기준 (조정 가능)
+        if score_std < -0.7:
+            use_dys_model = True
+            print("📉 확신도 낮음 -> 특화 모델 전환")
+            
+        # 조건 B: 텍스트가 너무 짧음 (오인식 가능성 높음)
+        elif len(text_std) < 3:
+            use_dys_model = True
+            print("📉 텍스트 너무 짧음 -> 특화 모델 전환")
+
+        # 조건 C: [Override] 병원 키워드가 있으면 무조건 일반 모델 신뢰
+        # (구음장애 모델은 '비타민', '연필' 등 생활 용어에 편향되어 있을 수 있음)
+        for kw in HEALTH_KEYWORDS:
+            if kw in text_std:
+                use_dys_model = False
+                print(f"🏥 병원 키워드('{kw}') 감지 -> 일반 모델 유지")
+                break
+
+        final_text = text_std
+
+        # -------------------------------------------------------
+        # 5. [2차] 구음장애 특화 모델 (필요 시 실행)
+        # -------------------------------------------------------
+        if use_dys_model:
+            print("🚀 [2단계] 구음장애 특화 모델 가동")
+
+            def transcribe_dys():
+                # Librosa로 로드 (WhisperProcessor 입력용)
+                audio_array, _ = librosa.load(processed_filename, sr=16000)
+                
+                # Processor 전처리
+                inputs = models.dys_processor(
+                    audio_array, 
+                    sampling_rate=16000, 
+                    return_tensors="pt"
+                ).input_features.to(models.device)
+
+                # 추론
+                with torch.no_grad():
+                    generated_ids = models.dys_model.generate(inputs, language="korean")
+
+                # 디코딩
+                transcription = models.dys_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                return transcription.strip()
+
+            text_dys = await asyncio.to_thread(transcribe_dys)
+            print(f"🗣️ [2차 결과] '{text_dys}'")
+
+            # 특화 모델 결과가 유의미하면 채택
+            if text_dys:
+                final_text = text_dys
+
+        # -------------------------------------------------------
+        # 6. [후처리] 텍스트 교정 (Post-processing)
+        # -------------------------------------------------------
+        # "화약" -> "허약" 강제 치환
+        if "화약" in final_text:
+            final_text = final_text.replace("화약", "허약")
+            print("🔧 텍스트 교정: 화약 -> 허약")
+
+        print(f"✅ 최종 확정: \"{final_text}\"")
+
+        # -------------------------------------------------------
+        # 7. 응답 처리
+        # -------------------------------------------------------
+        if not final_text:
+            await sio.emit('command-response', {"text": "잘 듣지 못했어요. 다시 말씀해 주세요.", "type": "simple"}, to=sid)
+            return
+
+        # 앱에 내 말 먼저 띄우기
+        await sio.emit('user-speech', {'text': final_text}, to=sid)
+
+        # Router 실행
+        response_data = await asyncio.to_thread(router.handle, final_text)
+        
+        # 최종 응답 전송
+        payload = format_response_payload(response_data)
+        await sio.emit('command-response', payload, to=sid)
+        print(f"📤 응답 전송: {payload}")
 
     except Exception as e:
         print(f"🚨 오디오 처리 중 에러: {e}")
-        await sio.emit('command-response', {"text": "오류가 발생했습니다.", "type": "error"}, to=sid)
+        import traceback
+        traceback.print_exc() # 상세 에러 로그 출력
+        await sio.emit('command-response', {"text": "처리 중 오류가 발생했습니다.", "type": "error"}, to=sid)
     
     finally:
-        # 8. [청소] 임시 파일들 삭제 (용량 관리)
+        # 파일 정리
         try:
             if raw_filename and os.path.exists(raw_filename):
                 os.remove(raw_filename)
             if processed_filename and os.path.exists(processed_filename):
                 os.remove(processed_filename)
-        except Exception as cleanup_error:
-            print(f"🧹 파일 삭제 중 오류 (무시): {cleanup_error}")
+        except Exception:
+            pass
 
 @sio.on('identify-face')
 async def handle_identify_face(sid, base64_image):

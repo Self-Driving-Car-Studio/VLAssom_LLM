@@ -13,6 +13,12 @@ class Router:
             # 편의를 위한 바로가기 (Alias)
             self.classifier = models.intent_classifier
             self.chat_model = models.chat_model
+            self.behavior_detector = models.behavior_detector
+            self.rag = models.rag
+            self.translator = models.translator
+            self.normalizer = models.normalizer
+            self.personal_response = models.personal_response
+            self.decision_model = models.decision_model
 
             # 2. 사용자별 고유 상태값 (여기는 개별 유지)
             self.waiting_for_decision = False
@@ -36,7 +42,7 @@ class Router:
 
     def handle(self, text: str):
         # 1) Intent 분류
-        intent_result = self.intent_classifier.classify(text)
+        intent_result = self.classifier.classify(text)
         intent = intent_result.intent
         print(f"[Intent] {intent} ({intent_result.reason})")
 
@@ -48,7 +54,7 @@ class Router:
                 if self.pending_task in self.action_map:
                     payload = self.action_map[self.pending_task]
                     self._execute_command(payload) # Value 전송
-                    response = "알겠습니다. 처리할게요!"
+                    response = "알겠습니다. 바로 가져다드릴게요!"
                 else:
                     response = "오류가 발생했습니다. 해당 명령 코드를 찾을 수 없어요."
             else:
@@ -116,7 +122,7 @@ class Router:
             if action_key in self.action_map:
                 self.waiting_for_decision = True
                 self.pending_task = action_key
-                return suggestion_text
+                return suggestion_text, action_key
             
             else:
                 # [수정] 매칭 실패 시 원인을 출력해주는 로그 추가

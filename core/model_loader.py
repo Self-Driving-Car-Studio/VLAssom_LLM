@@ -8,6 +8,7 @@ from models.rag.personal_rag import PersonalRAG
 from models.rag.personal_response import PersonalResponse
 from models.rag.behavior_detector import BehaviorDetector
 from models.rag.decision_model import DecisionModel
+import whisper
 
 class ModelContainer:
     _instance = None
@@ -24,6 +25,9 @@ class ModelContainer:
         self.personal_response = PersonalResponse()
         self.behavior_detector = BehaviorDetector()
         self.decision_model = DecisionModel()
+
+        print("👂 Whisper(STT) 모델 로딩 중...")
+        self.stt_model = whisper.load_model("base")
 
         # 제안 후 응답 상태
         self.waiting_for_decision = False

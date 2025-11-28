@@ -27,7 +27,7 @@ class ModelContainer:
         self.decision_model = DecisionModel()
 
         print("👂 Whisper(STT) 모델 로딩 중...")
-        self.stt_model = whisper.load_model("base")
+        self.stt_model = whisper.load_model("small")
 
         # 제안 후 응답 상태
         self.waiting_for_decision = False

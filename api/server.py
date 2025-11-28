@@ -6,14 +6,23 @@ import os
 import base64
 import numpy as np
 import cv2
-from typing import Dict, Any, Union, Optional
+from typing import Dict, Any, Optional
 import base64
 import uuid
 import asyncio
 
+from pydub import AudioSegment
+from pydub.effects import normalize as pydub_normalize
+
 # 커스텀 모듈
 from core.router import Router
 from core.model_loader import ModelContainer
+
+try:
+    import audioop_lts
+    sys.modules["audioop"] = audioop_lts
+except ImportError:
+    pass
 
 # 환경 설정
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
@@ -156,7 +165,7 @@ async def handle_action_confirm(sid, data):
 @sio.on('audio-upload')
 async def handle_audio_upload(sid, data):
     """
-    앱 -> 서버: 음성 데이터 수신 -> STT -> Router -> 응답
+    앱 -> 서버: 음성 수신 -> [전처리] -> Whisper STT -> Router -> 응답
     """
     print(f"🎤 오디오 데이터 수신 ({sid})")
     
@@ -164,8 +173,12 @@ async def handle_audio_upload(sid, data):
     if not router:
         return
 
+    # 임시 파일 경로 변수들 초기화
+    raw_filename = None
+    processed_filename = None
+
     try:
-        # 1. 데이터 파싱 및 저장 준비
+        # 1. 데이터 파싱
         b64_string = data.get('audioData')
         file_ext = data.get('format', 'm4a')
         user_id = data.get('userId', 'unknown')
@@ -173,64 +186,98 @@ async def handle_audio_upload(sid, data):
         # Base64 디코딩
         audio_bytes = base64.b64decode(b64_string)
         
-        # uploads 폴더 확보
         if not os.path.exists('uploads'):
             os.makedirs('uploads')
             
-        # 임시 파일명 생성 및 저장
-        filename = f"uploads/{user_id}_{uuid.uuid4()}.{file_ext}"
-        
-        # [주의] 파일 쓰기는 동기 작업이므로, 비동기 래핑 없이 쓸 땐 빠를수록 좋음
-        # 파일이 크다면 aiofiles 라이브러리 고려, 지금은 그냥 진행
-        with open(filename, "wb") as f:
+        # 2. 원본 파일 저장 (.m4a)
+        raw_filename = f"uploads/{user_id}_{uuid.uuid4()}.{file_ext}"
+        with open(raw_filename, "wb") as f:
             f.write(audio_bytes)
             
-        print(f"💾 파일 저장 완료: {filename}")
+        print(f"💾 원본 저장 완료: {raw_filename}")
 
-        # -------------------------------------------------------
-        # 2. Whisper STT 변환 (오래 걸리므로 별도 스레드 실행)
-        # -------------------------------------------------------
-        print("👂 음성 인식 중...")
-        
-        # 모델 가져오기
+        # =======================================================
+        # [✨ 추가됨] 3. 오디오 전처리 (Preprocessing)
+        # Whisper가 가장 좋아하는 형태(16kHz, Mono, Normalized)로 변환
+        # =======================================================
+        def preprocess_audio():
+            print("🎛️ 오디오 전처리 중... (Resample & Normalize)")
+            
+            # 원본 로드
+            audio = AudioSegment.from_file(raw_filename, format=file_ext)
+            
+            # (1) 모노로 변환 (채널 1개)
+            audio = audio.set_channels(1)
+            
+            # (2) 주파수 16000Hz로 변경 (Whisper 내부 표준)
+            audio = audio.set_frame_rate(16000)
+            
+            # (3) 볼륨 정규화 (작은 목소리 증폭)
+            audio = pydub_normalize(audio)
+            
+            # 전처리된 파일명 생성 (.wav)
+            new_filename = raw_filename.replace(f".{file_ext}", "_processed.wav")
+            
+            # wav 포맷으로 저장
+            audio.export(new_filename, format="wav")
+            return new_filename
+
+        # 전처리 실행 (동기 작업이므로 스레드로 분리 권장)
+        processed_filename = await asyncio.to_thread(preprocess_audio)
+        print(f"✨ 전처리 완료: {processed_filename}")
+
+        # =======================================================
+        # 4. Whisper STT 변환
+        # =======================================================
+        print("👂 Whisper 인식 중...")
         stt_model = global_models.stt_model
         
-        # 실제 추론 실행 함수 (내부 함수로 정의하거나 별도로 뺌)
         def transcribe_audio():
-            # fp16=False는 CPU 경고 방지용 (GPU 있으면 제거 가능)
-            return stt_model.transcribe(filename, language="ko", fp16=False)
+            # [중요] 원본 대신 '전처리된 wav 파일'을 넣습니다.
+            # beam_size=5: 정확도를 위해 탐색 폭을 넓힘 (기본값 1보다 느리지만 정확함)
+            return stt_model.transcribe(
+                processed_filename, 
+                language="ko", 
+                fp16=False,
+                beam_size=5,
+                initial_prompt="건강 상담, 몸 상태, 허약 체질, 병원 진료에 대한 대화입니다."
+            )
 
-        # 쓰레드에서 실행 (서버 멈춤 방지)
         result = await asyncio.to_thread(transcribe_audio)
         recognized_text = result['text'].strip()
         
         print(f"🗣️ 인식된 텍스트: \"{recognized_text}\"")
 
         # -------------------------------------------------------
-        # 3. 인식된 텍스트를 Router(두뇌)에 전달
+        # 5. 실패 처리 및 사용자 피드백 전송
         # -------------------------------------------------------
         if not recognized_text:
-            await sio.emit('command-response', {"text": "음성이 잘 들리지 않았어요.", "type": "simple"}, to=sid)
-            return
-        
-        await sio.emit('user-speech', {'text': recognized_text}, to=sid)
+            await sio.emit('command-response', {"text": "음성이 너무 작거나 들리지 않았어요.", "type": "simple"}, to=sid)
+        else:
+            # 인식 성공 시, 앱에 내 말 먼저 띄워주기
+            await sio.emit('user-speech', {'text': recognized_text}, to=sid)
 
-        # [핵심] 텍스트가 된 명령어를 기존 handle 함수에 그대로 넣습니다!
-        response_data = await asyncio.to_thread(router.handle, recognized_text)
-        
-        # 4. 결과 응답 (format_response_payload 헬퍼 사용)
-        payload = format_response_payload(response_data)
-
-
-        await sio.emit('command-response', payload, to=sid)
-        print(f"📤 응답 전송: {payload}")
-
-        # 5. (선택) 임시 파일 삭제 (용량 관리)
-        os.remove(filename)
+            # 6. Router 실행
+            response_data = await asyncio.to_thread(router.handle, recognized_text)
+            
+            # 7. 최종 응답
+            payload = format_response_payload(response_data)
+            await sio.emit('command-response', payload, to=sid)
+            print(f"📤 응답 전송: {payload}")
 
     except Exception as e:
         print(f"🚨 오디오 처리 중 에러: {e}")
-        await sio.emit('command-response', {"text": "음성 처리에 실패했습니다.", "type": "error"}, to=sid)
+        await sio.emit('command-response', {"text": "오류가 발생했습니다.", "type": "error"}, to=sid)
+    
+    finally:
+        # 8. [청소] 임시 파일들 삭제 (용량 관리)
+        try:
+            if raw_filename and os.path.exists(raw_filename):
+                os.remove(raw_filename)
+            if processed_filename and os.path.exists(processed_filename):
+                os.remove(processed_filename)
+        except Exception as cleanup_error:
+            print(f"🧹 파일 삭제 중 오류 (무시): {cleanup_error}")
 
 @sio.on('identify-face')
 async def handle_identify_face(sid, base64_image):

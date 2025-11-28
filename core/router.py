@@ -12,6 +12,9 @@ from models.rag.personal_response import PersonalResponse
 from models.rag.behavior_detector import BehaviorDetector
 from models.rag.decision_model import DecisionModel
 
+# [NEW] 로봇 통신 클라이언트 임포트
+from core.robot_client import RobotClient
+
 class Router:
     def __init__(self):
         # 모듈 초기화
@@ -24,6 +27,9 @@ class Router:
         self.personal_response = PersonalResponse()
         self.behavior_detector = BehaviorDetector()
         self.decision_model = DecisionModel()
+        
+        # [NEW] 로봇 클라이언트 초기화 (IP는 환경에 맞게 수정, 포트는 8080)
+        self.robot_client = RobotClient(host="192.168.0.20", port=8080)
 
         self.waiting_for_decision = False
         self.pending_task = None
@@ -38,10 +44,15 @@ class Router:
         except FileNotFoundError:
             print(f"[System] Warning: {map_path} not found.")
 
-    # [전송 함수] Value(긴 코드)를 받아서 전송만 담당
+    # [전송 함수] Value를 받아서 실제 로봇 서버로 전송
     def _execute_command(self, payload_value: str):
-        print(f"🚀 [ROBOT SEND] Sending payload: {payload_value}")
-        # 실제 통신 코드 (ROS, HTTP 등) 작성 위치
+        # 기존 print 대신 RobotClient를 통해 HTTP 요청 전송
+        success = self.robot_client.send_task(payload_value)
+        
+        if success:
+            print(f"✅ [Router] Command successfully sent to Robot Server: {payload_value}")
+        else:
+            print(f"💀 [Router] Failed to send command to Robot Server.")
 
     def handle(self, text: str):
         # 1) Intent 분류
@@ -56,7 +67,10 @@ class Router:
                 # pending_task는 이미 정확한 Key 값이므로 바로 Map에서 꺼냄
                 if self.pending_task in self.action_map:
                     payload = self.action_map[self.pending_task]
-                    self._execute_command(payload) # Value 전송
+                    
+                    # [실행] 로봇 전송
+                    self._execute_command(payload)
+                    
                     response = "알겠습니다. 처리할게요!"
                 else:
                     response = "오류가 발생했습니다. 해당 명령 코드를 찾을 수 없어요."
@@ -79,18 +93,20 @@ class Router:
             # (3) Router -> Map Lookup -> Value 획득
             if command_key in self.action_map:
                 robot_payload = self.action_map[command_key]
+                
+                # [실행] 로봇 전송
                 self._execute_command(robot_payload)
+                
                 return "네, 처리할게요."
             else:
                 return "죄송해요. 제가 수행할 수 없는 명령이에요."
 
-        # 4) Dialog 처리 (제안 로직 수정됨)
+        # 4) Dialog 처리 (제안 로직)
         if intent == "dialog":
             need_action = self.behavior_detector.detect(text)
             
             # (행동 불필요) -> 단순 대화
             if not need_action:
-                # ... (기존과 동일)
                 context = self.rag.build_context(text)
                 if context and context.strip():
                     prompt = (
@@ -108,11 +124,8 @@ class Router:
             # PersonalResponse가 "멘트 || Key" 형태로 반환함
             generated_output = self.personal_response.generate(text, context)
             
-            # [수정 포인트] 따옴표(")까지 확실하게 제거하도록 수정
             if "||" in generated_output:
                 suggestion_text, action_key = generated_output.split("||")
-                
-                # 공백(.strip()) 뿐만 아니라 따옴표(.strip('"'))도 제거
                 suggestion_text = suggestion_text.strip().strip('"') 
                 action_key = action_key.strip().strip('"')           
             else:
@@ -128,10 +141,8 @@ class Router:
                 return suggestion_text
             
             else:
-                # [수정] 매칭 실패 시 원인을 출력해주는 로그 추가
                 if action_key != "NONE":
                     print(f"⚠️ [WARNING] 생성된 Key '{action_key}'가 action_map에 없습니다!")
-                    print(f"   (보유 중인 Keys: {list(self.action_map.keys())})")
                 
                 return suggestion_text
 

@@ -350,7 +350,7 @@ async def handle_audio_upload(sid, data):
         # ------------------------------------------------------------------
         use_dys_model = False
         # Medium은 성능이 좋으므로 임계값을 조금 낮게 잡아도 됨 (예: -0.6 ~ -0.7)
-        CONFIDENCE_THRESHOLD = -0.6 
+        CONFIDENCE_THRESHOLD = -0.3
 
         if score_std < CONFIDENCE_THRESHOLD:
             print(f"📉 신뢰도 낮음({score_std:.2f}) -> 2차 검증 필요")

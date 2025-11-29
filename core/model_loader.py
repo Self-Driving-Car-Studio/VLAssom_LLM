@@ -48,7 +48,7 @@ class ModelContainer:
         # ---------------------------------------------------------
         print("👂 Whisper 모델 2종(Medium, Small) 로딩 중...")
 
-        ID_MEDIUM = "openai/whisper-medium"
+        ID_MEDIUM = "openai/whisper-large"
         ID_SMALL = "openai/whisper-small"
         ADAPTER_PATH = "./models/whisper-finetuned-v1"
 

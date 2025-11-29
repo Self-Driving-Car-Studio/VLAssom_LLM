@@ -63,13 +63,14 @@ class Router:
 
     # [전송 함수] Value를 받아서 실제 로봇 서버로 전송
     def _execute_command(self, payload_value: str):
+        print(f"✅ [Router] Command successfully sent to Robot Server")
         # 기존 print 대신 RobotClient를 통해 HTTP 요청 전송
-        success = self.robot_client.send_task(payload_value)
+        # success = self.robot_client.send_task(payload_value)
         
-        if success:
-            print(f"✅ [Router] Command successfully sent to Robot Server: {payload_value}")
-        else:
-            print(f"💀 [Router] Failed to send command to Robot Server.")
+        # if success:
+        #     print(f"✅ [Router] Command successfully sent to Robot Server: {payload_value}")
+        # else:
+        #     print(f"💀 [Router] Failed to send command to Robot Server.")
 
     def handle(self, text: str):
         # [Step 0] 언어 감지 및 텍스트 정리
@@ -137,7 +138,13 @@ class Router:
             # 현재 언어 설정 확인
             lang_code = "en" if is_english else "ko"
             
+            # [Log] 대화 요청 수신 및 언어 확인
+            print(f"[Dialog Request] Input: '{clean_text}' | Language: {lang_code}")
+            
             need_action = self.behavior_detector.detect(clean_text)
+            
+            # [Log] 행동 감지 결과
+            print(f"[Behavior Detection] Result: {'Action Needed' if need_action else 'Chat Only'}")
             
             # ---------------------------------------------------------
             # (Case A) 행동 불필요 -> 단순 대화 (ChatModel 사용)
@@ -145,28 +152,37 @@ class Router:
             if not need_action:
                 context = self.rag.build_context(clean_text)
                 
+                # [Log] RAG가 가져온 문맥 확인
+                print(f"[RAG Context - Chat] {context}")
+                
                 # ChatModel에 전달할 입력 텍스트 구성
-                # (시스템 프롬프트는 ChatModel 내부에서 lang에 따라 자동 추가됨)
                 chat_input = clean_text
                 if context and context.strip():
-                    # 문맥이 있다면 사용자 입력 앞에 붙여서 전달
                     chat_input = f"User Profile/Context: {context}\n\nUser Input: {clean_text}"
                 
-                # [핵심 수정] 변경된 ChatModel.chat(text, lang) 호출
-                return self.chat_model.chat(chat_input, lang=lang_code)
+                response = self.chat_model.chat(chat_input, lang=lang_code)
+                
+                # [Log] 최종 응답 기록
+                print(f"[Chat Response] Generated: {response}")
+                return response
 
             # ---------------------------------------------------------
             # (Case B) 행동 필요 -> 제안 생성 (PersonalResponse 사용)
             # ---------------------------------------------------------
             context = self.rag.build_context(clean_text)
             
+            # [Log] RAG가 가져온 문맥 확인
+            print(f"[RAG Context - Action] {context}")
+            
             # PersonalResponse 모델 입력 구성
             gen_input_text = clean_text
-            # PersonalResponse 모델은 별도 lang 파라미터가 없다면, 텍스트에 지시어 추가
             if is_english:
                 gen_input_text += " (Respond in English)"
 
-            generated_output = self.personal_response.generate(gen_input_text, context)
+            generated_output = self.personal_response.generate(gen_input_text, context, lang_code)
+            
+            # [Log] LLM 원본 출력 (파싱 전 데이터 확인용)
+            print(f"[Raw LLM Output] {generated_output}")
             
             # [안전장치] 파싱 로직 강화 ("멘트 || 키")
             suggestion_text = generated_output
@@ -174,25 +190,32 @@ class Router:
 
             if "||" in generated_output:
                 parts = generated_output.split("||")
-                # 혹시 ||가 여러 개일 경우를 대비해 첫 번째와 두 번째 요소만 취함
                 if len(parts) >= 2:
                     suggestion_text = parts[0].strip().strip('"') 
                     action_key = parts[1].strip().strip('"')
             else:
                 suggestion_text = generated_output.strip().strip('"')
 
-            print(f"[Proposal Log] 멘트: {suggestion_text} / 키: {action_key}")
+            # [Log] 파싱 결과 확인
+            print(f"[Parsed Proposal] Text: '{suggestion_text}' / Key: '{action_key}'")
 
             # 유효한 Key가 있는 경우에만 대기 상태 진입
             if action_key in self.action_map:
                 self.waiting_for_decision = True
                 self.pending_task = action_key
-                # (텍스트, 메타데이터) 튜플 형태로 반환하여 서버가 type='confirm'으로 처리하게 함
+                
+                # [Log] 유효 키 확인 및 대기 상태 진입
+                print(f"[Action Decision] Valid Key '{action_key}'. Entering wait state.")
+                
                 return suggestion_text, action_key
             
             else:
                 if action_key != "NONE":
-                    print(f"⚠️ [WARNING] 생성된 Key '{action_key}'가 action_map에 없습니다!")
+                    # [Log] 경고: 키는 나왔으나 맵에 없음
+                    print(f"⚠️ [WARNING] Invalid Action Key Detected: '{action_key}' (Not in action_map)")
+                else:
+                    # [Log] 키 없음 (단순 제안 멘트만 생성됨)
+                    print("[Action Decision] No actionable key found. Returning text only.")
                 
                 # 키가 없거나 잘못된 경우 멘트만 반환
                 return suggestion_text

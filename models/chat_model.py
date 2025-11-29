@@ -16,63 +16,77 @@ class ChatModel:
         self.model_name = model_name
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+
     def chat(self, text: str, lang: str = "ko") -> str:
-        # 1. 언어별 프롬프트 분기
-        if lang == "en":
-            # [영어 모드]
-            system_instruction = """
-            You are a friendly robot assistant.
-            Respond to the user naturally and warmly in English, using only one sentence.
-            Strictly exclude translations, parentheses (), emojis, role-playing, or follow-up questions.
-            Feel free to engage in small talk like weather or daily life.
-            However, if the input is playful, meaningless, or unclear, 
-            reply with: "Please let me know if you need anything."
-            """
-        else:
-            # [한국어 모드]
-            system_instruction = """
-            당신은 친절한 로봇 도우미입니다.
-            사용자의 말에 대해 한국어로 따뜻하고 자연스럽게 한 문장으로만 답변하세요.
-            영어, 번역문, 괄호(), 이모지, 역할극 지문, 되묻는 질문은 절대 포함하지 마세요.
-            날씨나 일상적인 대화에는 공감하며 반응하되,
-            만약 사용자의 입력이 장난스럽거나 의미가 불명확하다면
-            "필요한 것이 있으면 말씀해주세요." 라고 정중히 답하세요.
-            """
+            # 1. 언어별 시스템 프롬프트 구성
+            if lang == "en":
+                # [영어 모드]
+                system_instruction = """
+                [Role]
+                You are 'Blossom', a warm and friendly robot companion.
+                
+                [Instructions]
+                1. Respond naturally and warmly in English.
+                2. Keep your answer concise (1-2 sentences) for spoken conversation.
+                3. NEVER say "As an AI" or "I don't have access to real-time data."
+                4. If asked about real-time info (weather, news) that you don't know, 
+                use your imagination to give a positive, vague response (e.g., "I hope the sun is shining for you!").
+                5. Strictly exclude translations, parentheses (), emojis, or role-play markers.
+                6. If the input is meaningless or rude, politely ask: "Please let me know if you need anything."
+                """
+            else:
+                # [한국어 모드]
+                system_instruction = """
+                [Role]
+                당신은 사용자의 곁에 있는 '따뜻하고 다정한 로봇 비서'입니다.
+                
+                [Instructions]
+                1. 사용자의 말에 공감하고 친절하게 반응하세요.
+                2. '날씨', '뉴스', '시간' 등 당신이 센서가 없어 알 수 없는 실시간 정보를 물어보면, 
+                "저는 AI라 모릅니다"라고 딱딱하게 답하지 마세요.
+                대신 "창밖을 보니 햇살이 참 좋네요!" 또는 "글쎄요, 기분 좋은 바람이 불 것 같아요." 처럼 
+                상상력을 발휘해 긍정적이고 감성적으로 대처하세요. (거짓말이라도 분위기를 맞추는 것이 우선입니다.)
+                3. 답변은 한국어로, 읽기 편하게 1~2문장 정도로 간결하고 다정하게 하세요.
+                4. 괄호(), 이모지(😊), 번역문, 영어 단어는 절대 포함하지 마세요.
+                """
 
-        prompt = f"""
-                    {system_instruction}
+            prompt = f"""
+                        {system_instruction}
 
-                    문장(Input): {text}
-                    답변(Response):
-                    """
+                        [User Input]
+                        "{text}"
 
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.4,
-                max_tokens=64
-            )
+                        [Output]
+                        """
 
-            result = response.choices[0].message.content.strip()
+            try:
+                # 2. OpenAI API 호출
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.7, # 창의적인 답변을 위해 약간 높임 (0.4 -> 0.7)
+                    max_tokens=100   # 문장이 너무 길어지지 않도록 제한
+                )
 
-            # 2. 후처리 필터링 (언어별 안전장치)
-            
-            # 공통: 괄호 및 괄호 안의 내용 제거 (감정 표현 등 제거)
-            result = re.sub(r"\(.*?\)", "", result)
+                result = response.choices[0].message.content.strip()
 
-            if lang == "ko":
-                # [한국어 모드] 영어 알파벳 제거 (기존 로직 유지)
-                # 단, 요즘은 "TV 켜줘" 같이 영어를 섞어 쓰는 경우도 있으므로 
-                # 필요에 따라 이 줄은 주석 처리해도 됩니다.
-                result = re.sub(r"[A-Za-z]", "", result)
-            
-            # [영어 모드]에서는 알파벳을 제거하면 안 되므로 필터링 건너뜀
+                # 3. 후처리 필터링 (TTS 오작동 방지)
+                # 괄호와 그 안의 내용 제거 (예: (웃으며))
+                result = re.sub(r"\(.*?\)", "", result)
+                result = re.sub(r"\[.*?\]", "", result)
+                
+                # 이모지 및 특수 기호 제거 (기본 문장부호 .,?! 제외)
+                # 영어/한글/숫자/기본 문장부호만 남김
+                # (영어를 아예 제거하면 'TV' 같은 단어를 못 읽으므로 영어는 허용하되 프롬프트로 제어)
+                result = re.sub(r"[^\w\s.,?!가-힣a-zA-Z]", "", result)
+                
+                return result.strip()
 
-            return result.strip()
-
-        except Exception as e:
-            print(f"[ChatModel] Error: {e}")
-            return "Error occurred." if lang == "en" else "오류가 발생했습니다."
+            except Exception as e:
+                print(f"[ChatModel] Error: {e}")
+                if lang == "en":
+                    return "I'm having a little trouble thinking right now."
+                else:
+                    return "잠시 생각이 꼬였어요. 다시 말씀해 주시겠어요?"

@@ -162,9 +162,12 @@ class PersonalRAG:
     def search(self, query: str, top_k: int = None) -> List[Tuple[str, float]]:
         if top_k is None:
             top_k = self.top_k
-
-        # Step 4 자동 Query Expansion
-        expanded_query = self.auto_expand_query(query)
+        # 수정: 쿼리가 너무 짧으면(3어절 미만) 확장을 하지 않고 원문 그대로 검색
+        if len(query.split()) < 3:
+            expanded_query = query
+        else:
+            # Step 4 자동 Query Expansion
+            expanded_query = self.auto_expand_query(query)
 
         # 1) embedding
         q_emb = self._embed_texts([expanded_query])

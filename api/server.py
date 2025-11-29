@@ -11,7 +11,8 @@ from typing import Dict, Any, Optional
 import uuid
 import librosa 
 import torch
-from contextlib import nullcontext 
+from contextlib import nullcontext
+import tempfile
 
 from pydub import AudioSegment
 from pydub.effects import normalize as pydub_normalize
@@ -31,8 +32,41 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 PORT = int(os.getenv("PORT", 3000))
-HEALTH_KEYWORDS = ["병원", "진료", "의사", "간호사", "증상", "아파", "예약", "상담", "건강", "수술", "검진", "약", "복용"]
-EMERGENCY_KEYWORDS = ["정지", "멈춰", "서라", "스톱", "STOP", "SOS", "비상"]
+
+# [수정] 다국어 키워드 및 시스템 메시지 정의
+KEYWORDS = {
+    "ko": {
+        "health": ["병원", "진료", "의사", "간호사", "증상", "아파", "예약", "상담", "건강", "수술", "검진", "약", "복용"],
+        "emergency": ["정지", "멈춰", "서라", "스톱", "STOP", "SOS", "비상"],
+        "whisper_lang": "korean"
+    },
+    "en": {
+        "health": ["hospital", "doctor", "nurse", "symptom", "pain", "hurt", "appointment", "consult", "health", "surgery", "checkup", "medicine", "pill"],
+        "emergency": ["stop", "halt", "freeze", "emergency", "sos", "help"],
+        "whisper_lang": "english"
+    }
+}
+
+SYSTEM_MESSAGES = {
+    "ko": {
+        "emergency_stop": "비상 정지합니다.",
+        "emergency_ack": "비상 정지 명령을 확인했습니다. 로봇을 즉시 정지합니다.",
+        "server_error": "서버 초기화 오류",
+        "process_error": "처리 중 오류 발생",
+        "exec_error": "실행 오류 발생",
+        "not_heard": "잘 듣지 못했어요.",
+        "decode_error": "이미지 디코딩 실패"
+    },
+    "en": {
+        "emergency_stop": "Initiating emergency stop.",
+        "emergency_ack": "Emergency stop command received. Stopping robot immediately.",
+        "server_error": "Server initialization error",
+        "process_error": "Processing error",
+        "exec_error": "Execution error",
+        "not_heard": "I couldn't hear you clearly.",
+        "decode_error": "Image decode failed"
+    }
+}
 
 # ----------------------------------------------------------------
 # 성능 측정 유틸리티 클래스
@@ -103,13 +137,22 @@ def get_or_create_router(sid: str) -> Optional[Router]:
             return None
     return sessions[sid]
 
-async def execute_emergency_stop(sid, user_id):
-    print(f"🛑 [EMERGENCY] 로봇 정지 실행: User={user_id}")
+# [수정] 언어별 메시지 처리
+async def execute_emergency_stop(sid, user_id, lang="ko"):
+    print(f"🛑 [EMERGENCY] 로봇 정지 실행: User={user_id}, Lang={lang}")
+    msg = SYSTEM_MESSAGES.get(lang, SYSTEM_MESSAGES["ko"])["emergency_stop"]
+    
     await sio.emit('command-response', {
-        "text": "비상 정지합니다.", 
+        "text": msg, 
         "type": "simple",
         "meta": {"emergency": True}
     }, to=sid)
+
+def build_prompt_with_lang(text: str, lang: str) -> str:
+    """언어 설정에 따라 Router에 전달할 텍스트 가공"""
+    if lang == 'en':
+        return f"{text} (Please respond in English)"
+    return text
 
 # ----------------------------------------------------------------
 # 4. 이벤트 핸들러
@@ -129,11 +172,18 @@ async def disconnect(sid):
 async def handle_pause(sid, data):
     print(f"\n[!!! EMERGENCY !!!] 🚨 비상 정지 요청됨 ({data})")
     router = get_or_create_router(sid)
+    
     user_text = data.get('text', '')
+    lang = data.get('lang', 'ko') 
+    
+    sys_msg = SYSTEM_MESSAGES.get(lang, SYSTEM_MESSAGES["ko"])
+
     with PerformanceTimer("비상 정지 처리"):
+        # Router는 Pause 처리에 언어가 필요 없을 수 있지만, 혹시 모르니 전달 로직 유지
         await asyncio.to_thread(router.handle, user_text)
+    
     await sio.emit('command-response', {
-        "text": "비상 정지 명령을 확인했습니다. 로봇을 즉시 정지합니다.",
+        "text": sys_msg["emergency_ack"],
         "type": "simple",
         "meta": {"status": "stopped", "emergency": True}
     }, to=sid)
@@ -142,34 +192,52 @@ async def handle_pause(sid, data):
 async def handle_command(sid, data):
     print(f"📩 수신 ({sid}): {data}")
     user_text = data.get('text', '')
+    lang = data.get('lang', 'ko') 
+    sys_msg = SYSTEM_MESSAGES.get(lang, SYSTEM_MESSAGES["ko"])
+
     router = get_or_create_router(sid)
     if not router:
-        await sio.emit('command-response', {"text": "서버 초기화 오류", "type": "error"}, to=sid)
+        await sio.emit('command-response', {"text": sys_msg["server_error"], "type": "error"}, to=sid)
         return
 
     try:
         with PerformanceTimer("텍스트 명령 처리 (Router)"):
-            response_data = await asyncio.to_thread(router.handle, user_text)
+            # [핵심 수정] 언어가 영어일 경우 Router에게 지시어 전달
+            router_input = user_text
+            if lang == 'en':
+                router_input = f"{user_text} (Please respond in English)"
+            
+            response_data = await asyncio.to_thread(router.handle, router_input)
+        
         payload = format_response_payload(response_data)
         await sio.emit('command-response', payload, to=sid)
         print(f"📤 전송: {payload}")
     except Exception as e:
         print(f"🚨 처리 중 에러: {e}")
-        await sio.emit('command-response', {"text": "처리 중 오류 발생", "type": "error"}, to=sid)
+        await sio.emit('command-response', {"text": sys_msg["process_error"], "type": "error"}, to=sid)
 
 @sio.on('action-confirm')
 async def handle_action_confirm(sid, data):
     print(f"🔘 버튼 클릭 수신 (YES): {data}")
+    lang = data.get('lang', 'ko')
+    sys_msg = SYSTEM_MESSAGES.get(lang, SYSTEM_MESSAGES["ko"])
+
     router = get_or_create_router(sid)
     if not router: return
     try:
         with PerformanceTimer("확인 명령 처리 (Router)"):
-            response_data = await asyncio.to_thread(router.handle, "네")
+            # [핵심 수정] 긍정 답변도 언어에 맞게 변환 및 지시어 추가
+            confirm_text = "Yes" if lang == "en" else "네"
+            if lang == 'en':
+                confirm_text += " (Please respond in English)"
+            
+            response_data = await asyncio.to_thread(router.handle, confirm_text)
+        
         payload = format_response_payload(response_data)
         await sio.emit('command-response', payload, to=sid)
     except Exception as e:
         print(f"🚨 실행 중 에러: {e}")
-        await sio.emit('command-response', {"text": "실행 오류 발생", "type": "error"}, to=sid)
+        await sio.emit('command-response', {"text": sys_msg["exec_error"], "type": "error"}, to=sid)
 
 @sio.on('audio-upload')
 async def handle_audio_upload(sid, data):
@@ -177,160 +245,193 @@ async def handle_audio_upload(sid, data):
     total_timer = PerformanceTimer("오디오 처리 전체 (Total Flow)")
     total_timer.__enter__()
 
-    router = get_or_create_router(sid)
-    if not router: return
+    # 1. 언어 및 설정 로드
+    lang = data.get('lang', 'ko')
+    if lang not in KEYWORDS: lang = "ko"
+    
+    current_keywords = KEYWORDS[lang]
+    sys_msg = SYSTEM_MESSAGES[lang]
+    # HuggingFace Whisper는 'korean', 'english' 등으로 풀네임 사용 권장
+    whisper_lang_code = current_keywords["whisper_lang"] 
 
-    raw_filename = None
-    processed_filename = None
+    router = get_or_create_router(sid)
+    if not router: 
+        total_timer.__exit__(None, None, None)
+        return
+
+    # 임시 파일 경로 변수 초기화
+    temp_raw_path = None
+    temp_wav_path = None
+
+    # 전역 모델 컨테이너 참조
+    models = global_models 
 
     try:
-        # 1. 파일 저장
-        with PerformanceTimer("1. 오디오 파일 저장"):
+        # ------------------------------------------------------------------
+        # 1. 파일 저장 및 전처리 (Tempfile 사용으로 안정성 확보)
+        # ------------------------------------------------------------------
+        with PerformanceTimer("1. 오디오 파일 저장 및 변환"):
             b64_string = data.get('audioData')
             file_ext = data.get('format', 'm4a')
-            user_id = data.get('userId', 'unknown')
-            audio_bytes = base64.b64decode(b64_string)
-            if not os.path.exists('uploads'): os.makedirs('uploads')
-            raw_filename = f"uploads/{user_id}_{uuid.uuid4()}.{file_ext}"
-            with open(raw_filename, "wb") as f: f.write(audio_bytes)
-
-        # 2. 전처리 (16kHz WAV 변환)
-        def preprocess_audio():
-            audio = AudioSegment.from_file(raw_filename, format=file_ext)
-            audio = audio.set_channels(1)       
-            audio = audio.set_frame_rate(16000) 
-            audio = pydub_normalize(audio)      
-            new_filename = raw_filename.replace(f".{file_ext}", "_processed.wav")
-            audio.export(new_filename, format="wav")
-            return new_filename
-
-        with PerformanceTimer("2. 오디오 전처리 (Pydub)"):
-            processed_filename = await asyncio.to_thread(preprocess_audio)
-
-        # 3. [1차] 일반 인식 (LoRA 비활성화 -> 순정 Whisper)
-        print("👂 [1단계] 일반 모델 인식 중 (LoRA Off)...")
-        models = global_models 
-
-        def transcribe_std():
-            audio_array, _ = librosa.load(processed_filename, sr=16000)
             
+            # Base64 디코딩
+            try:
+                if not b64_string: raise ValueError("Empty audio data")
+                audio_bytes = base64.b64decode(b64_string)
+            except Exception:
+                print("🚨 Base64 디코딩 실패")
+                await sio.emit('command-response', {"text": sys_msg["process_error"], "type": "error"}, to=sid)
+                return
+
+            # (1) Raw 파일 생성 (자동 삭제 방지를 위해 delete=False, finally에서 삭제)
+            with tempfile.NamedTemporaryFile(suffix=f".{file_ext}", delete=False) as tmp_raw:
+                tmp_raw.write(audio_bytes)
+                temp_raw_path = tmp_raw.name
+            
+            # (2) WAV 변환 대상 경로 생성
+            temp_wav_path = temp_raw_path.replace(f".{file_ext}", "_processed.wav")
+
+            # (3) Pydub 변환 (블로킹 작업이므로 스레드 분리)
+            def convert_audio():
+                audio = AudioSegment.from_file(temp_raw_path, format=file_ext)
+                audio = audio.set_channels(1)       # 모노
+                audio = audio.set_frame_rate(16000) # 16kHz (Whisper 표준)
+                audio = pydub_normalize(audio)      # 볼륨 정규화
+                audio.export(temp_wav_path, format="wav")
+                return temp_wav_path
+
+            await asyncio.to_thread(convert_audio)
+
+        # ------------------------------------------------------------------
+        # 2. [1차] Medium 모델로 일반 인식 (순정 모델 사용)
+        # ------------------------------------------------------------------
+        print(f"👂 [1단계] Medium 모델 인식 (Lang: {whisper_lang_code})...")
+
+        def transcribe_medium():
+            # librosa로 로드 (sr=16000)
+            audio_array, _ = librosa.load(temp_wav_path, sr=16000) 
+            
+            # Processor는 공용 사용 (토크나이저 호환됨)
             inputs = models.processor(
                 audio_array, 
                 sampling_rate=16000, 
                 return_tensors="pt"
             ).input_features.to(models.device)
             
-            adapter_context = nullcontext()
-            if hasattr(models.stt_model, "disable_adapter"):
-                adapter_context = models.stt_model.disable_adapter()
-
-            with adapter_context:
-                with torch.no_grad():
-                    # [수정] output_scores=True로 신뢰도 점수 계산 준비
-                    outputs = models.stt_model.generate(
-                        inputs,
-                        language="korean",
-                        max_new_tokens=128,
-                        return_dict_in_generate=True, # 결과 객체 반환
-                        output_scores=True            # 점수(Logits) 반환
-                    )
+            # [1차] Medium 모델 추론 (순정)
+            # stt_model_medium은 순정 WhisperForConditionalGeneration 객체임
+            with torch.no_grad():
+                outputs = models.stt_model_medium.generate(
+                    inputs,
+                    language=whisper_lang_code, 
+                    max_new_tokens=128,
+                    return_dict_in_generate=True, 
+                    output_scores=True            
+                )
             
-            # 텍스트 디코딩
             generated_ids = outputs.sequences
             text = models.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
             
-            # [신규] 신뢰도(Log Prob) 점수 계산
-            # transition_scores: 생성된 토큰들의 로그 확률 계산
-            transition_scores = models.stt_model.compute_transition_scores(
+            # 신뢰도(Log Probability) 계산
+            transition_scores = models.stt_model_medium.compute_transition_scores(
                 outputs.sequences, outputs.scores, normalize_logits=True
             )
-            # 평균 로그 확률 계산 (높을수록 좋음, 보통 0 ~ -N 음수값)
-            # exp()를 취하면 확률(0~1)이 되지만, 보통 log_prob 상태로 비교함
             avg_logprob = torch.mean(transition_scores[0]).item()
             
             return text.strip(), avg_logprob
 
-        with PerformanceTimer("3. STT 1차 (Whisper Base)"):
-            text_std, score_std = await asyncio.to_thread(transcribe_std)
+        with PerformanceTimer("3. STT 1차 (Whisper Medium)"):
+            text_std, score_std = await asyncio.to_thread(transcribe_medium)
         
-        print(f"🗣️ [1차 결과] '{text_std}' (신뢰도: {score_std:.4f})")
+        print(f"🗣️ [1차 Medium 결과] '{text_std}' (신뢰도: {score_std:.4f})")
 
-        # 4. [판단] 적합도 검사 (점수가 낮으면 불확실함 -> 구음장애 모델 사용)
+        # ------------------------------------------------------------------
+        # 3. [판단] 적합도 검사 및 분기
+        # ------------------------------------------------------------------
         use_dys_model = False
-        
-        # Whisper의 avg_logprob는 보통 음수입니다. 
-        # -1.0 보다 낮으면 확신이 부족한 상태로 간주 (경험적 임계값 -0.7 ~ -1.0)
-        # 예: -0.2(매우 확실), -0.8(보통), -1.5(불확실)
-        CONFIDENCE_THRESHOLD = -0.5
+        # Medium은 성능이 좋으므로 임계값을 조금 낮게 잡아도 됨 (예: -0.6 ~ -0.7)
+        CONFIDENCE_THRESHOLD = -0.6 
 
         if score_std < CONFIDENCE_THRESHOLD:
-            print(f"📉 신뢰도 낮음({score_std:.2f} < {CONFIDENCE_THRESHOLD}) -> 정밀 분석 필요")
+            print(f"📉 신뢰도 낮음({score_std:.2f}) -> 2차 검증 필요")
             use_dys_model = True
-        
-        # [옵션] 너무 짧은 텍스트도 불확실하므로 포함 (원하시면 제거 가능)
         elif len(text_std) < 2: 
+            print("📉 텍스트 너무 짧음 -> 2차 검증 필요")
             use_dys_model = True
 
-        # 키워드 체크 (명확한 키워드가 있으면 점수가 낮아도 통과시킬 수 있음)
-        for kw in HEALTH_KEYWORDS:
-            if kw in text_std: use_dys_model = False; break
-        for kw in EMERGENCY_KEYWORDS:
-            if kw in text_std: use_dys_model = False; break
+        # 중요 키워드가 1차에서 이미 명확히 들렸다면 2차 생략 (오탐 방지)
+        for kw in current_keywords["health"]:
+            if kw.lower() in text_std.lower(): use_dys_model = False; break
+        for kw in current_keywords["emergency"]:
+            if kw.lower() in text_std.lower(): use_dys_model = False; break
 
         final_text = text_std
 
-        # 5. [2차] 정밀 추론 (LoRA 활성화 + Beam Search)
-        if use_dys_model:
-            print("🚀 [2단계] 구음장애 특화 모델 가동 (LoRA On + Beam Search)")
+        # ------------------------------------------------------------------
+        # 4. [2차] Small + LoRA 모델로 정밀 인식 (한국어일 때만 수행)
+        # ------------------------------------------------------------------
+        if use_dys_model and lang == 'ko': 
+            print("🚀 [2단계] Small + LoRA 모델 가동 (Beam Search)")
 
-            def transcribe_dys_candidates():
-                audio_array, _ = librosa.load(processed_filename, sr=16000)
-                
+            def transcribe_small_lora():
+                audio_array, _ = librosa.load(temp_wav_path, sr=16000)
                 inputs = models.processor(
-                    audio_array, 
-                    sampling_rate=16000, 
-                    return_tensors="pt"
+                    audio_array, sampling_rate=16000, return_tensors="pt"
                 ).input_features.to(models.device)
 
+                # [2차] Small + LoRA 모델 추론
+                # stt_model_small_lora는 PeftModel 객체임
                 with torch.no_grad():
-                    generated_ids = models.stt_model.generate(
+                    generated_ids = models.stt_model_small_lora.generate(
                         inputs, 
-                        language="korean",
-                        num_beams=5,             
-                        num_return_sequences=3,  
+                        language=whisper_lang_code,
+                        num_beams=5,             # 빔 서치로 정확도 향상
+                        num_return_sequences=3,  # 상위 3개 후보 추출
                         early_stopping=True
                     )
-                
-                candidates = models.processor.batch_decode(generated_ids, skip_special_tokens=True)
-                return candidates
+                return models.processor.batch_decode(generated_ids, skip_special_tokens=True)
 
-            with PerformanceTimer("4. STT 2차 (Dysarthria Model)"):
-                candidates = await asyncio.to_thread(transcribe_dys_candidates)
+            with PerformanceTimer("4. STT 2차 (Small+LoRA)"):
+                candidates = await asyncio.to_thread(transcribe_small_lora)
             
-            print(f"🧐 생성된 후보군: {candidates}")
+            print(f"🧐 [2차 후보군]: {candidates}")
             
             if candidates:
-                final_text = candidates[0]
+                final_text = candidates[0] # 기본적으로 1순위 채택
+                
+                # 후보군 중 응급/건강 키워드가 포함된 문장이 있다면 우선 채택 (Rescue Logic)
                 for cand in candidates:
-                    if any(kw in cand for kw in EMERGENCY_KEYWORDS):
+                    all_keywords = current_keywords["emergency"] + current_keywords["health"]
+                    if any(kw.lower() in cand.lower() for kw in all_keywords):
+                        print(f"✅ 키워드 매칭으로 후보 교체: {cand}")
                         final_text = cand
                         break
 
         print(f"✅ 최종 확정: \"{final_text}\"")
 
-        # 응답 처리
+        # ------------------------------------------------------------------
+        # 5. 결과 처리 및 라우터 전달
+        # ------------------------------------------------------------------
+        
+        # 인식된 텍스트가 없으면 종료
         if not final_text:
-            await sio.emit('command-response', {"text": "잘 듣지 못했어요.", "type": "simple"}, to=sid)
+            await sio.emit('command-response', {"text": sys_msg["not_heard"], "type": "simple"}, to=sid)
             return
 
+        # 사용자에게 인식된 텍스트 전송 (채팅창 표시용)
         await sio.emit('user-speech', {'text': final_text}, to=sid)
 
-        if any(kw in final_text for kw in EMERGENCY_KEYWORDS):
-            await execute_emergency_stop(sid, user_id)
+        # 비상 정지 키워드 체크 (최우선 순위)
+        if any(kw.lower() in final_text.lower() for kw in current_keywords["emergency"]):
+            await execute_emergency_stop(sid, data.get('userId', 'unknown'), lang)
             return
 
+        # Router 명령 처리
         with PerformanceTimer("5. Router 명령 처리"):
-            response_data = await asyncio.to_thread(router.handle, final_text)
+            # 언어에 따라 프롬프트 조정 (헬퍼 함수 사용)
+            router_input = build_prompt_with_lang(final_text, lang)
+            
+            response_data = await asyncio.to_thread(router.handle, router_input)
         
         payload = format_response_payload(response_data)
         await sio.emit('command-response', payload, to=sid)
@@ -338,28 +439,60 @@ async def handle_audio_upload(sid, data):
     except Exception as e:
         print(f"🚨 오디오 처리 중 에러: {e}")
         import traceback; traceback.print_exc()
-        await sio.emit('command-response', {"text": "오류 발생", "type": "error"}, to=sid)
+        await sio.emit('command-response', {"text": sys_msg["process_error"], "type": "error"}, to=sid)
     
     finally:
+        # ------------------------------------------------------------------
+        # 6. 임시 파일 정리 (반드시 수행)
+        # ------------------------------------------------------------------
         try:
-            if raw_filename and os.path.exists(raw_filename): os.remove(raw_filename)
-            if processed_filename and os.path.exists(processed_filename): os.remove(processed_filename)
-        except Exception: pass
+            if temp_raw_path and os.path.exists(temp_raw_path):
+                os.remove(temp_raw_path)
+            if temp_wav_path and os.path.exists(temp_wav_path):
+                os.remove(temp_wav_path)
+        except Exception as e:
+            print(f"⚠️ 파일 정리 실패: {e}")
+        
         total_timer.__exit__(None, None, None)
 
 @sio.on('identify-face')
-async def handle_identify_face(sid, base64_image):
-    print(f"📸 {sid} 이미지 수신")
+async def handle_identify_face(sid, data):
+    print(f"📸 {sid} 얼굴 인식 요청 수신")
+    
+    # [수정] 데이터 파싱 (클라이언트가 객체로 보낼 때와 문자열로 보낼 때 모두 대응)
+    lang = "ko"
+    base64_image = ""
+
+    if isinstance(data, dict):
+        base64_image = data.get('image', '')
+        lang = data.get('lang', 'ko')
+    else:
+        # 기존 클라이언트 호환성 유지 (문자열만 온 경우)
+        base64_image = data
+        lang = "ko"
+
     try:
         with PerformanceTimer("이미지 디코딩"):
             img = await asyncio.to_thread(decode_image, base64_image)
+        
         if img is None:
             await sio.emit('auth-fail', {"reason": "image_decode_error"}, to=sid)
             return
         
+        # [Mock] 얼굴 인식 로직 (가정)
         await asyncio.sleep(0.5)
-        user = {"id": "p123", "name": "김블라"}
+        
+        # [핵심 수정] 언어에 따른 이름 분기 처리
+        if lang == 'en':
+            user_name = "KimVla"
+        else:
+            user_name = "김블라"
+            
+        user = {"id": "p123", "name": user_name}
+        
+        print(f"✅ 인증 성공: {user_name} ({lang})")
         await sio.emit('auth-success', user, to=sid)
+        
     except Exception as e:
         print(f"🚨 인증 오류: {e}")
         await sio.emit('auth-fail', to=sid)

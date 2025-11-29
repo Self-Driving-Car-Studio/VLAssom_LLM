@@ -4,6 +4,28 @@ from core.robot_client import RobotClient
 
 class Router:
     # =================================================
+    #  다국어 고정 응답 메시지 정의
+    # =================================================
+    RESPONSES = {
+        "ko": {
+            "ok_fetch": "알겠습니다. 바로 가져다드릴게요!",
+            "err_code": "오류가 발생했습니다. 해당 명령 코드를 찾을 수 없어요.",
+            "ok_standby": "알겠습니다. 필요한 게 있을 때 다시 말씀해주세요.",
+            "cmd_ok": "네, 처리할게요.",
+            "cmd_cant": "죄송해요. 제가 수행할 수 없는 명령이에요.",
+            "unknown": "무슨 말씀이신지 잘 이해하지 못했어요."
+        },
+        "en": {
+            "ok_fetch": "Understood. I'll get that for you right away!",
+            "err_code": "An error occurred. I cannot find that command code.",
+            "ok_standby": "Understood. Let me know if you need anything else.",
+            "cmd_ok": "Okay, I'll handle that.",
+            "cmd_cant": "I'm sorry, I cannot perform that command.",
+            "unknown": "I didn't quite understand what you meant."
+        }
+    }
+
+    # =================================================
     #  메인 처리 함수
     # =================================================
 
@@ -50,24 +72,40 @@ class Router:
             print(f"💀 [Router] Failed to send command to Robot Server.")
 
     def handle(self, text: str):
-        # 1) Intent 분류
-        intent_result = self.classifier.classify(text)
+        # [Step 0] 언어 감지 및 텍스트 정리
+        # server.py에서 영어를 요청할 때 덧붙인 태그를 확인
+        is_english = False
+        if "(Please respond in English)" in text:
+            is_english = True
+            # 모델 인식을 위해 태그를 제거한 순수 텍스트 추출
+            clean_text = text.replace("(Please respond in English)", "").strip()
+        else:
+            clean_text = text
+
+        # 현재 언어에 맞는 메시지 팩 선택
+        lang_key = "en" if is_english else "ko"
+        msgs = self.RESPONSES[lang_key]
+
+        # 1) Intent 분류 (태그 제거된 텍스트 사용)
+        intent_result = self.classifier.classify(clean_text)
         intent = intent_result.intent
-        print(f"[Intent] {intent} ({intent_result.reason})")
+        print(f"[Intent] {intent} ({intent_result.reason}) / English Mode: {is_english}")
 
         # 2) 제안 수락 여부 (Decision)
         if self.waiting_for_decision:
-            decision = self.decision_model.decide(text)
+            # Decision 모델은 "응", "Yes" 등을 처리 (모델이 다국어를 지원한다고 가정)
+            decision = self.decision_model.decide(clean_text)
+            
             if decision == "YES":
                 # pending_task는 이미 정확한 Key 값이므로 바로 Map에서 꺼냄
                 if self.pending_task in self.action_map:
                     payload = self.action_map[self.pending_task]
                     self._execute_command(payload) # Value 전송
-                    response = "알겠습니다. 바로 가져다드릴게요!"
+                    response = msgs["ok_fetch"]
                 else:
-                    response = "오류가 발생했습니다. 해당 명령 코드를 찾을 수 없어요."
+                    response = msgs["err_code"]
             else:
-                response = "알겠습니다. 필요한 게 있을 때 다시 말씀해주세요."
+                response = msgs["ok_standby"]
 
             self.waiting_for_decision = False
             self.pending_task = None
@@ -75,8 +113,9 @@ class Router:
 
         # 3) Robot Command 처리 (직접 명령)
         if intent == "robot_command":
-            # (1) 번역
-            english_text = self.translator.translate(text)
+            # (1) 번역 (clean_text 사용)
+            # 영어 모드라면 번역기가 영->영 변환을 하거나, 그대로 통과시켜야 함
+            english_text = self.translator.translate(clean_text)
             
             # (2) Normalizer -> Key 획득 (예: "serve_tylenol")
             command_key = self.normalizer.normalize(english_text)
@@ -89,40 +128,58 @@ class Router:
                 # [실행] 로봇 전송
                 self._execute_command(robot_payload)
                 
-                return "네, 처리할게요."
+                return msgs["cmd_ok"]
             else:
-                return "죄송해요. 제가 수행할 수 없는 명령이에요."
+                return msgs["cmd_cant"]
 
         # 4) Dialog 처리 (제안 로직)
         if intent == "dialog":
-            need_action = self.behavior_detector.detect(text)
+            # 현재 언어 설정 확인
+            lang_code = "en" if is_english else "ko"
             
-            # (행동 불필요) -> 단순 대화
+            need_action = self.behavior_detector.detect(clean_text)
+            
+            # ---------------------------------------------------------
+            # (Case A) 행동 불필요 -> 단순 대화 (ChatModel 사용)
+            # ---------------------------------------------------------
             if not need_action:
-                context = self.rag.build_context(text)
+                context = self.rag.build_context(clean_text)
+                
+                # ChatModel에 전달할 입력 텍스트 구성
+                # (시스템 프롬프트는 ChatModel 내부에서 lang에 따라 자동 추가됨)
+                chat_input = clean_text
                 if context and context.strip():
-                    prompt = (
-                        f"사용자 프로필:\n{context}\n\n"
-                        f"사용자 입력:\n{text}\n\n"
-                        "위 정보를 바탕으로 공감하는 짧은 답변을 하세요."
-                    )
-                    return self.chat_model.chat(prompt)
-                else:
-                    return self.chat_model.chat(text)
+                    # 문맥이 있다면 사용자 입력 앞에 붙여서 전달
+                    chat_input = f"User Profile/Context: {context}\n\nUser Input: {clean_text}"
+                
+                # [핵심 수정] 변경된 ChatModel.chat(text, lang) 호출
+                return self.chat_model.chat(chat_input, lang=lang_code)
 
-            # (행동 필요) -> 제안 생성 (Key 포함)
-            context = self.rag.build_context(text)
+            # ---------------------------------------------------------
+            # (Case B) 행동 필요 -> 제안 생성 (PersonalResponse 사용)
+            # ---------------------------------------------------------
+            context = self.rag.build_context(clean_text)
             
-            # PersonalResponse가 "멘트 || Key" 형태로 반환함
-            generated_output = self.personal_response.generate(text, context)
+            # PersonalResponse 모델 입력 구성
+            gen_input_text = clean_text
+            # PersonalResponse 모델은 별도 lang 파라미터가 없다면, 텍스트에 지시어 추가
+            if is_english:
+                gen_input_text += " (Respond in English)"
+
+            generated_output = self.personal_response.generate(gen_input_text, context)
             
+            # [안전장치] 파싱 로직 강화 ("멘트 || 키")
+            suggestion_text = generated_output
+            action_key = "NONE"
+
             if "||" in generated_output:
-                suggestion_text, action_key = generated_output.split("||")
-                suggestion_text = suggestion_text.strip().strip('"') 
-                action_key = action_key.strip().strip('"')           
+                parts = generated_output.split("||")
+                # 혹시 ||가 여러 개일 경우를 대비해 첫 번째와 두 번째 요소만 취함
+                if len(parts) >= 2:
+                    suggestion_text = parts[0].strip().strip('"') 
+                    action_key = parts[1].strip().strip('"')
             else:
                 suggestion_text = generated_output.strip().strip('"')
-                action_key = "NONE"
 
             print(f"[Proposal Log] 멘트: {suggestion_text} / 키: {action_key}")
 
@@ -130,12 +187,14 @@ class Router:
             if action_key in self.action_map:
                 self.waiting_for_decision = True
                 self.pending_task = action_key
+                # (텍스트, 메타데이터) 튜플 형태로 반환하여 서버가 type='confirm'으로 처리하게 함
                 return suggestion_text, action_key
             
             else:
                 if action_key != "NONE":
                     print(f"⚠️ [WARNING] 생성된 Key '{action_key}'가 action_map에 없습니다!")
                 
+                # 키가 없거나 잘못된 경우 멘트만 반환
                 return suggestion_text
 
-        return "무슨 말씀이신지 잘 이해하지 못했어요."
+        return msgs["unknown"]

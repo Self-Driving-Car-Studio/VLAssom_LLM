@@ -65,12 +65,12 @@ class Router:
     def _execute_command(self, payload_value: str):
         print(f"✅ [Router] Command successfully sent to Robot Server")
         # 기존 print 대신 RobotClient를 통해 HTTP 요청 전송
-        # success = self.robot_client.send_task(payload_value)
+        success = self.robot_client.send_task(payload_value)
         
-        # if success:
-        #     print(f"✅ [Router] Command successfully sent to Robot Server: {payload_value}")
-        # else:
-        #     print(f"💀 [Router] Failed to send command to Robot Server.")
+        if success:
+            print(f"✅ [Router] Command successfully sent to Robot Server: {payload_value}")
+        else:
+            print(f"💀 [Router] Failed to send command to Robot Server.")
 
     def handle(self, text: str):
         # [Step 0] 언어 감지 및 텍스트 정리
